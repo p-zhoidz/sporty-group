@@ -12,9 +12,23 @@ docker compose up -d
 ./gradlew bootRun
 ```
 
-Приложение запускается на `http://localhost:8080`, Kafka — на `localhost:9092`.
-Docker Compose запускает только broker. При старте приложения Spring `KafkaAdmin` создаёт
-три рабочих топика и три соответствующих DLT-топика.
+Приложение запускается на `http://localhost:8080`, Kafka — на `localhost:9092`, RocketMQ
+NameServer — на `localhost:9876`. Docker Compose запускает Kafka, RocketMQ NameServer и
+RocketMQ Broker. При старте приложения Spring `KafkaAdmin` создаёт три рабочих Kafka-топика
+и три соответствующих DLT-топика. RocketMQ Broker автоматически создаёт топик
+`bet-settlements` при первой публикации.
+
+Без дополнительного Spring profile settlement-команды выводятся через
+`LoggingSettlementPublisher`. Для реальной доставки и обработки через RocketMQ используется
+profile `rocketmq`:
+
+```bash
+./gradlew bootRun --args='--spring.profiles.active=rocketmq'
+```
+
+Profile `in-memory` предназначен для автоматических full-flow тестов и вызывает settlement
+ставки напрямую, минуя RocketMQ.
+
 Пример запроса (ставки должны уже присутствовать в таблице `bets`):
 
 ```bash
@@ -45,7 +59,7 @@ Kafka Streams topology отбрасывает его по persistent state store
 
 ```bash
 docker compose up -d
-./gradlew bootRun --args='--spring.profiles.active=local'
+./gradlew bootRun --args='--spring.profiles.active=local,rocketmq'
 ```
 
 После отправки outcome для нужного `eventId` соответствующие ставки получат статус `WON`
@@ -68,6 +82,7 @@ HTTP → event-outcomes
      → Kafka Streams deduplication by eventId
      → settlement-page-tasks
      → bet-settlement-commands
+     → RocketMQ bet-settlements
      → idempotent settlement ставки
 ```
 
@@ -76,8 +91,8 @@ Streams использует `exactly_once_v2`, поэтому marker обраб
 page-task и входной offset фиксируются атомарно.
 
 Malformed outcome сразу направляется Streams topology в `event-outcomes.DLT`. Для page-task
-и settlement-command выполняются три повтора с интервалом 1 секунду, после чего сообщение
-транзакционно переносится в соответствующий DLT:
+и Kafka settlement-command выполняются три повтора с интервалом 1 секунду, после чего
+сообщение транзакционно переносится в соответствующий Kafka DLT:
 
 ```text
 event-outcomes.DLT
@@ -86,7 +101,15 @@ bet-settlement-commands.DLT
 ```
 
 DLT сохраняет key и payload. Основные и DLT-топики объявлены в
-`KafkaTopicConfig`, а не создаются Docker Compose.
+`KafkaTopicConfig`, а не создаются Docker Compose. RocketMQ consumer выполняет до трёх
+повторов временных ошибок, после чего Broker переносит сообщение в
+`%DLQ%settlement-rocketmq-consumers`. Malformed message, отсутствующая ставка или
+конфликтующий результат логируются на уровне `WARN` и подтверждаются без повторов.
+
+Граница Kafka → RocketMQ имеет at-least-once semantics: producer ждёт `SEND_OK`, однако при
+сбое после RocketMQ ack и до Kafka commit сообщение может быть отправлено повторно. В
+RocketMQ message key передаётся `betId`, а consumer применяет условный
+`UPDATE ... WHERE status=PENDING`, поэтому повтор имеет идемпотентный эффект.
 
 При нескольких экземплярах Streams `application-id` должен оставаться одинаковым, а
 `INSTANCE_ID` обычного Kafka transactional producer — быть уникальным. Локальная in-memory
@@ -98,5 +121,6 @@ H2 предназначена для одного процесса; горизо
 ./gradlew test
 ```
 
-Набор включает Kafka Streams topology tests, unit-, JPA integration- и параметризованный
-full-flow тест с Embedded Kafka, а также проверку реального переноса malformed outcome в DLT.
+Набор включает Kafka Streams topology tests, unit-тесты RocketMQ adapter/consumer, JPA
+integration- и параметризованный full-flow тест с Embedded Kafka, а также проверку реального
+переноса malformed outcome в DLT.

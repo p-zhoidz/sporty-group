@@ -5,6 +5,7 @@ import com.sportygroup.settlement.bet.model.BetEntity;
 import com.sportygroup.settlement.bet.model.BetStatus;
 import com.sportygroup.settlement.bet.repository.BetRepository;
 import com.sportygroup.settlement.outcome.api.EventOutcomeRequest;
+import org.apache.kafka.common.serialization.StringDeserializer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
@@ -16,10 +17,10 @@ import org.springframework.http.MediaType;
 import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.test.EmbeddedKafkaBroker;
-import org.springframework.kafka.test.utils.KafkaTestUtils;
 import org.springframework.kafka.test.context.EmbeddedKafka;
+import org.springframework.kafka.test.utils.KafkaTestUtils;
+import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
-import org.apache.kafka.common.serialization.StringDeserializer;
 
 import java.math.BigDecimal;
 import java.time.Duration;
@@ -46,6 +47,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
         "spring.kafka.streams.application-id=test-${random.uuid}"
 })
 @AutoConfigureMockMvc
+@ActiveProfiles("in-memory")
 @EmbeddedKafka(
         partitions = 3,
         brokerProperties = {

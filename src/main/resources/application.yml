@@ -59,7 +59,15 @@ app:
     concurrency: 4
   delivery:
     concurrency: 4
-    transport: in-memory
+  rocketmq:
+    name-server: ${ROCKETMQ_NAME_SERVER:localhost:9876}
+    topic: bet-settlements
+    producer-group: settlement-rocketmq-producers
+    consumer-group: settlement-rocketmq-consumers
+    send-timeout: 10s
+    send-retries: 3
+    max-reconsume-times: 3
+    consumer-enabled: true
 logging:
   level:
     com.sportygroup.settlement: INFO

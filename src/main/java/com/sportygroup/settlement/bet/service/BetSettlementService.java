@@ -12,7 +12,9 @@ public class BetSettlementService {
 
     public enum Result {
         APPLIED,
-        DUPLICATE_OR_MISSING
+        DUPLICATE,
+        MISSING,
+        CONFLICT
     }
 
     private final BetRepository betRepository;
@@ -26,6 +28,12 @@ public class BetSettlementService {
     @Transactional
     public Result settle(String betId, BetStatus result) {
         int affected = betRepository.settleIfPending(betId, result, clock.instant());
-        return affected == 1 ? Result.APPLIED : Result.DUPLICATE_OR_MISSING;
+        if (affected == 1) {
+            return Result.APPLIED;
+        }
+
+        return betRepository.findById(betId)
+                .map(bet -> bet.getStatus() == result ? Result.DUPLICATE : Result.CONFLICT)
+                .orElse(Result.MISSING);
     }
 }

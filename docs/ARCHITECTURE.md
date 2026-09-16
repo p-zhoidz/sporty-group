@@ -14,9 +14,11 @@
 - после outcome новые ставки на событие не создаются;
 - потеря данных H2 при полном перезапуске допустима;
 - таблица `bets` не расширяется служебными полями orchestration;
-- базовый settlement transport — in-memory adapter; настоящий RocketMQ adapter отсутствует.
+- в profile `rocketmq` settlement доставляется через RocketMQ; `betId` используется как
+  business idempotency key;
+- Kafka и RocketMQ не объединяются в XA/2PC-транзакцию.
 
-Стек: Java 21, Spring Boot 3.5, Spring Kafka, Kafka Streams, Spring Data JPA, H2.
+Стек: Java 21, Spring Boot 3.5, Spring Kafka, Kafka Streams, RocketMQ 5.3, Spring Data JPA, H2.
 
 ## 2. Сквозной flow
 
@@ -46,9 +48,12 @@ PageTaskConsumer
                                                 │
                                                 ▼
                                          DeliveryConsumer
-                                                │
+                                                │ synchronous send; key=betId
                                                 ▼
-                                         SettlementPublisher
+                                      RocketMQ: bet-settlements
+                                                │ at-least-once
+                                                ▼
+                                      RocketMQ SettlementConsumer
                                                 │
                                                 ▼
                          UPDATE bets SET status=? WHERE status=PENDING
@@ -65,8 +70,13 @@ PageTaskConsumer
 | `settlement-page-tasks.DLT` | 32 | исходный key | Необработанная page task |
 | `bet-settlement-commands.DLT` | 32 | исходный key | Необработанная settlement-команда |
 
-Топики создаёт Spring `KafkaAdmin` из `NewTopic` beans при старте приложения. Docker Compose
-поднимает только Kafka broker. Replication factor локального профиля равен 1.
+RocketMQ использует топик `bet-settlements` с message key `betId`. После трёх неуспешных
+попыток consumer RocketMQ помещает сообщение в системный DLQ-топик
+`%DLQ%settlement-rocketmq-consumers`.
+
+Kafka-топики создаёт Spring `KafkaAdmin` из `NewTopic` beans при старте приложения. Docker
+Compose поднимает Kafka broker, RocketMQ NameServer и RocketMQ Broker. RocketMQ topic
+создаётся broker-ом при первой публикации. Replication factor локальной Kafka равен 1.
 
 Kafka Streams дополнительно создаёт compacted changelog для persistent state store
 `processed-event-outcomes`. Changelog позволяет восстановить состояние после рестарта или
@@ -146,9 +156,16 @@ LIMIT :pageSize
 
 ### 4.4. Доставка settlement
 
-Команды имеют `key=betId`, поэтому ставки одного большого event распределяются между
-partition-ами и delivery workers. Базовый `InMemorySettlementPublisher` вызывает
-`BetSettlementService`, выполняющий:
+Команды имеют Kafka `key=betId`, поэтому ставки одного большого event распределяются между
+partition-ами bridge workers. `RocketMqSettlementPublisher` сериализует команду, назначает
+RocketMQ message key равным `betId` и выполняет синхронный send с ожиданием `SEND_OK`.
+
+Если RocketMQ не подтвердил send, Kafka listener бросает исключение и его входная Kafka-
+транзакция откатывается. Если RocketMQ подтвердил send, но процесс упал до Kafka commit,
+команда будет опубликована повторно. Общей транзакции между брокерами нет, поэтому граница
+Kafka → RocketMQ имеет at-least-once semantics.
+
+RocketMQ consumer вызывает `BetSettlementService`, выполняющий:
 
 ```sql
 UPDATE bets
@@ -156,9 +173,13 @@ SET status = :result, settled_at = :now
 WHERE bet_id = :betId AND status = 'PENDING'
 ```
 
-Kafka offset и DB commit не являются общей транзакцией. Если DB commit прошёл, а consumer
-упал до Kafka commit, команда придёт повторно; conditional update изменит 0 строк. Поэтому
-граница Kafka → DB имеет at-least-once delivery с идемпотентным эффектом.
+Если DB commit прошёл, а RocketMQ не получил успешный consume result, команда придёт
+повторно; conditional update изменит 0 строк. Поэтому итоговая обработка также имеет
+at-least-once delivery с идемпотентным эффектом. Технический RocketMQ `msgId` для dedup не
+используется: стабильным бизнес-ключом остаётся `betId`. Повтор с тем же результатом
+подтверждается как duplicate. Malformed message, отсутствующий `betId` и конфликтующий
+результат считаются невосстановимыми: consumer пишет `WARN` и подтверждает сообщение без
+retry. Неожиданная DB/runtime ошибка возвращает `RECONSUME_LATER`.
 
 ## 5. Транзакционные границы
 
@@ -167,7 +188,8 @@ Kafka offset и DB commit не являются общей транзакцие�
 | HTTP → `event-outcomes` | ждать broker ack | После `202` record принят Kafka |
 | outcome → dedup store + первая task | Kafka Streams `exactly_once_v2` | Один output на `eventId` |
 | page task → commands + next task | Kafka transaction | Offset и все output records атомарны |
-| settlement command → H2 | conditional update | At-least-once, идемпотентный эффект |
+| Kafka command → RocketMQ | sync send + Kafka retry | At-least-once, возможны дубликаты |
+| RocketMQ settlement → H2 | conditional update | At-least-once, идемпотентный эффект |
 | poison page/command → DLT | transactional recovery | DLT record и recovered offset атомарны |
 
 Consumers используют `isolation.level=read_committed`. JPA и Kafka transaction managers
@@ -186,6 +208,13 @@ Page-task и settlement-command listeners используют общий `Defau
 
 Malformed outcome обрабатывает сама Streams topology и сразу направляет в
 `event-outcomes.DLT`; повторять детерминированную ошибку парсинга смысла нет.
+
+Ошибка публикации Kafka settlement-command в RocketMQ приводит к rollback Kafka offset и
+обычному Kafka retry. После трёх повторов исходная команда попадает в
+`bet-settlement-commands.DLT`. Временная DB/runtime ошибка RocketMQ consumer возвращает
+`RECONSUME_LATER`; после трёх повторов RocketMQ Broker переносит сообщение в
+`%DLQ%settlement-rocketmq-consumers`. Malformed, missing и conflict не ретраятся: они
+логируются на уровне `WARN` и подтверждаются.
 
 ## 7. Основные edge cases
 
@@ -215,8 +244,11 @@ Event содержит миллионы ставок
 Page/command стабильно не обрабатывается
   → после трёх повторов record транзакционно переносится в соответствующий DLT.
 
-DB commit settlement прошёл, Kafka commit не прошёл
-  → команда повторяется; UPDATE WHERE status=PENDING становится no-op.
+RocketMQ ack получен, Kafka commit не прошёл
+  → команда повторно публикуется в RocketMQ с тем же business key=betId.
+
+DB commit settlement прошёл, RocketMQ consume result потерян
+  → сообщение повторяется; UPDATE WHERE status=PENDING становится no-op.
 ```
 
 ## 8. Масштабирование
@@ -226,8 +258,10 @@ DB commit settlement прошёл, Kafka commit не прошёл
   восстанавливается из changelog.
 - Page workers масштабируются между events partition-ами `settlement-page-tasks`.
 - Один event последовательно производит страницы, поэтому cursor не требует lock/lease.
-- Delivery workers масштабируются partition-ами `bet-settlement-commands`, включая команды
-  одного большого event.
+- Kafka → RocketMQ bridge workers масштабируются partition-ами
+  `bet-settlement-commands`, включая команды одного большого event.
+- RocketMQ consumers с общей group распределяют сообщения между экземплярами; повторная
+  доставка безопасна благодаря conditional update.
 - Память expansion ограничена `O(pageSize)`.
 
 Локальный H2 остаётся одно-процессным профилем. Для реального горизонтального
@@ -250,8 +284,9 @@ com.sportygroup.settlement
 ├── delivery
 │   ├── model        BetSettlementCommand
 │   ├── service      delivery orchestration
-│   ├── messaging    settlement-command listener
-│   └── transport    SettlementPublisher adapters
+│   ├── messaging    Kafka bridge listener and RocketMQ consumer
+│   ├── transport    SettlementPublisher adapters, including RocketMQ
+│   └── config       RocketMQ producer/consumer lifecycle and properties
 ├── bet
 │   ├── model        BetEntity, BetStatus, BetProjection
 │   ├── repository   BetRepository
@@ -271,6 +306,7 @@ spring:
       application-id: settlement-outcome-deduplicator
       properties:
         processing.guarantee: exactly_once_v2
+        replication.factor: 1
 
 app:
   kafka:
@@ -289,8 +325,27 @@ app:
     concurrency: 4
   delivery:
     concurrency: 4
-    transport: in-memory
+  rocketmq:
+    name-server: localhost:9876
+    topic: bet-settlements
+    producer-group: settlement-rocketmq-producers
+    consumer-group: settlement-rocketmq-consumers
+    send-timeout: 10s
+    send-retries: 3
+    max-reconsume-times: 3
+    consumer-enabled: true
 ```
+
+Settlement transport выбирается Spring profile, а не property:
+
+| Active profile | `SettlementPublisher` | Назначение |
+|---|---|---|
+| нет `rocketmq`/`in-memory` | `LoggingSettlementPublisher` | Безопасный default без внешней доставки |
+| `rocketmq` | `RocketMqSettlementPublisher` | Реальная доставка и consumer RocketMQ |
+| `in-memory` без `rocketmq` | `InMemorySettlementPublisher` | Изолированный full-flow тест |
+
+Profile `local` отвечает только за seed H2 и при необходимости комбинируется с `rocketmq`.
+Если одновременно активировать `rocketmq` и `in-memory`, выбирается RocketMQ adapter.
 
 ## 11. Проверки
 
@@ -299,6 +354,10 @@ app:
 - unit: winner/loser decision;
 - unit: пустая, неполная и полная page, включая continuation;
 - JPA integration: повторный settlement не меняет рассчитанную ставку;
+- unit: RocketMQ publisher ждёт `SEND_OK` и передаёт `betId` как business key;
+- unit: RocketMQ consumer подтверждает applied/duplicate/malformed/missing и ретраит
+  временную ошибку обработки;
 - full-flow integration с Embedded Kafka: HTTP → Streams dedup → page tasks → settlement
-  commands → статусы ставок, включая несколько страниц и повторный POST;
+  commands → `in-memory` profile → статусы ставок, включая несколько страниц и повторный
+  POST;
 - Kafka integration: malformed outcome реально появляется в `event-outcomes.DLT`.

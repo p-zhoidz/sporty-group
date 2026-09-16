@@ -33,7 +33,11 @@ class BetSettlementServiceIntegrationTest {
         assertThat(service.settle("bet-0001", BetStatus.WON))
                 .isEqualTo(BetSettlementService.Result.APPLIED);
         assertThat(service.settle("bet-0001", BetStatus.WON))
-                .isEqualTo(BetSettlementService.Result.DUPLICATE_OR_MISSING);
+                .isEqualTo(BetSettlementService.Result.DUPLICATE);
+        assertThat(service.settle("bet-0001", BetStatus.LOST))
+                .isEqualTo(BetSettlementService.Result.CONFLICT);
+        assertThat(service.settle("missing", BetStatus.WON))
+                .isEqualTo(BetSettlementService.Result.MISSING);
         assertThat(betRepository.findById("bet-0001").orElseThrow().getStatus())
                 .isEqualTo(BetStatus.WON);
     }
