@@ -31,6 +31,36 @@ API ждёт broker ack. Успешный запрос возвращает `202
 `503 Service Unavailable`. Повтор того же `eventId` также возвращает `202`, а downstream
 Kafka Streams topology отбрасывает его по persistent state store.
 
+### Локальный запуск с тестовыми ставками
+
+Профиль `local` добавляет в H2 19 ставок для пяти событий:
+
+| Event ID | Участники | Победитель для проверки |
+|---|---|---|
+| `event-123` | Team A vs Team B | `team-a` |
+| `event-456` | Team C vs Team D | `team-d` |
+| `event-789` | Team E vs Team F | `team-e` |
+| `event-101` | Team G vs Team H | `team-h` |
+| `event-202` | Team I vs Team J | `team-i` |
+
+```bash
+docker compose up -d
+./gradlew bootRun --args='--spring.profiles.active=local'
+```
+
+После отправки outcome для нужного `eventId` соответствующие ставки получат статус `WON`
+или `LOST`. Результат можно проверить в H2 Console по адресу
+`http://localhost:8080/h2-console` со следующими параметрами:
+
+```text
+JDBC URL: jdbc:h2:mem:settlement
+User Name: sa
+Password: <empty>
+```
+
+Тестовые данные находятся в `src/main/resources/db/local-data.sql` и не загружаются без
+активного профиля `local`.
+
 ## Основной flow
 
 ```text
