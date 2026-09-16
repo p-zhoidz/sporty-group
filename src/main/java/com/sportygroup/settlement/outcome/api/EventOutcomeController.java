@@ -20,10 +20,8 @@ public class EventOutcomeController {
 
     @PostMapping
     public ResponseEntity<EventOutcomeResponse> publish(@Valid @RequestBody EventOutcomeRequest request) {
-        var result = acceptOutcomeService.accept(request.toDomain());
-        var body = new EventOutcomeResponse(request.eventId(), result.name());
-        return result == AcceptOutcomeService.Result.ACCEPTED
-                ? ResponseEntity.accepted().body(body)
-                : ResponseEntity.ok(body);
+        acceptOutcomeService.accept(request.toDomain());
+        return ResponseEntity.accepted()
+                .body(new EventOutcomeResponse(request.eventId(), "ACCEPTED"));
     }
 }

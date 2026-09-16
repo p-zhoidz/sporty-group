@@ -27,18 +27,27 @@ curl -i -X POST http://localhost:8080/api/v1/event-outcomes \
   }'
 ```
 
-Первый запрос возвращает `202 ACCEPTED`, повтор того же `eventId` — `200 DUPLICATE`.
+API ждёт broker ack. Успешный запрос возвращает `202 ACCEPTED`, при недоступной Kafka —
+`503 Service Unavailable`. Повтор того же `eventId` также возвращает `202`, а downstream
+Kafka Streams topology отбрасывает его по persistent state store.
 
 ## Основной flow
 
 ```text
-HTTP → sharded event_outbox → event-outcomes
-     → settlement-page-tasks → bet-settlement-commands
+HTTP → event-outcomes
+     → Kafka Streams deduplication by eventId
+     → settlement-page-tasks
+     → bet-settlement-commands
      → idempotent settlement ставки
 ```
 
-Для каждого Kafka consumer действует единая recovery policy: первоначальная обработка и
-три повтора с интервалом 1 секунду. После этого сообщение транзакционно переносится в DLT:
+Outcome-outbox отсутствует: событие считается принятым только после подтверждения Kafka.
+Streams использует `exactly_once_v2`, поэтому marker обработанного `eventId`, начальная
+page-task и входной offset фиксируются атомарно.
+
+Malformed outcome сразу направляется Streams topology в `event-outcomes.DLT`. Для page-task
+и settlement-command выполняются три повтора с интервалом 1 секунду, после чего сообщение
+транзакционно переносится в соответствующий DLT:
 
 ```text
 event-outcomes.DLT
@@ -46,19 +55,12 @@ settlement-page-tasks.DLT
 bet-settlement-commands.DLT
 ```
 
-DLT сохраняет key, payload и исходный номер partition. Основные и DLT-топики объявлены в
+DLT сохраняет key и payload. Основные и DLT-топики объявлены в
 `KafkaTopicConfig`, а не создаются Docker Compose.
 
-Первый outbox статически распределяется между экземплярами. Такой запуск требует общей
-внешней SQL-базы; локальная in-memory H2 предназначена только для одного экземпляра с
-`EVENT_RELAY_INSTANCE_COUNT=1`:
-
-```bash
-EVENT_RELAY_INSTANCE_COUNT=2 EVENT_RELAY_INSTANCE_INDEX=0 INSTANCE_ID=worker-0 ./gradlew bootRun
-EVENT_RELAY_INSTANCE_COUNT=2 EVENT_RELAY_INSTANCE_INDEX=1 INSTANCE_ID=worker-1 ./gradlew bootRun
-```
-
-`INSTANCE_ID` должен быть уникальным для Kafka transactional producer каждого экземпляра.
+При нескольких экземплярах Streams `application-id` должен оставаться одинаковым, а
+`INSTANCE_ID` обычного Kafka transactional producer — быть уникальным. Локальная in-memory
+H2 предназначена для одного процесса; горизонтальный delivery требует общей SQL-базы ставок.
 
 ## Тесты
 
@@ -66,5 +68,5 @@ EVENT_RELAY_INSTANCE_COUNT=2 EVENT_RELAY_INSTANCE_INDEX=1 INSTANCE_ID=worker-1 .
 ./gradlew test
 ```
 
-Набор включает unit-, JPA integration- и параметризованный full-flow тест с Embedded Kafka,
-а также проверку реального переноса malformed message в DLT.
+Набор включает Kafka Streams topology tests, unit-, JPA integration- и параметризованный
+full-flow тест с Embedded Kafka, а также проверку реального переноса malformed outcome в DLT.

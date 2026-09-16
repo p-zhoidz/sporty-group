@@ -2,128 +2,124 @@
 
 Статус: реализовано. Дата: 2026-09-16.
 
-## 1. Цель и принятые ограничения
+## 1. Цель и ограничения
 
-Сервис принимает финальный исход события, надёжно публикует обязательное сообщение
-`event-outcomes`, находит все ставки события страницами и передаёт для расчёта отдельную
-команду на каждую ставку.
+Сервис принимает финальный исход события, публикует обязательное сообщение
+`event-outcomes`, дедуплицирует события по `eventId`, находит ставки страницами и создаёт
+отдельную settlement-команду для каждой ставки.
 
-Принятые для домашнего задания ограничения:
+Принятые ограничения домашнего задания:
 
-- один `eventId` получает только один финальный outcome; correction/resettlement нет;
+- один `eventId` имеет один финальный outcome; correction/resettlement нет;
 - после outcome новые ставки на событие не создаются;
 - потеря данных H2 при полном перезапуске допустима;
-- таблицу `bets` не требуется расширять служебными полями обработки;
-- базовый settlement transport — in-memory adapter; RocketMQ можно добавить за интерфейсом
-  `SettlementPublisher` без изменения остального flow.
+- таблица `bets` не расширяется служебными полями orchestration;
+- базовый settlement transport — in-memory adapter; настоящий RocketMQ adapter отсутствует.
 
-Стек: Java 21, Spring Boot 3.5, Spring Kafka, Spring Data JPA, H2.
+Стек: Java 21, Spring Boot 3.5, Spring Kafka, Kafka Streams, Spring Data JPA, H2.
 
-Локальный H2-профиль рассчитан на один процесс. Горизонтальное масштабирование API и
-outbox relay предполагает общую внешнюю SQL-базу: отдельные in-memory H2 разных JVM не
-видят строки друг друга. Это deployment-ограничение, а не дополнительный механизм в коде.
-
-## 2. Базовая схема
+## 2. Сквозной flow
 
 ```text
 Client
   │ POST /api/v1/event-outcomes
   ▼
 Outcome API
-  │ DB transaction: INSERT event_outbox(event_id, shard_id, payload)
+  │ publish key=eventId; ждать broker ack
   ▼
-Sharded EventOutboxRelay ── key=eventId ──► Kafka: event-outcomes
-                                             │ Kafka transaction
-                                             ▼
-                                    InitialTaskConsumer
-                                             │ key=eventId
-                                             ▼
-                              Kafka: settlement-page-tasks
-                                             │ Kafka transaction
-                                             ▼
-                                     PageTaskConsumer
-                                      │ DB keyset page
-                                      ├── key=betId ─► Kafka: bet-settlement-commands
-                                      └── key=eventId ► next settlement-page-task
-                                                               │
-                                                               ▼
-                                                    DeliveryConsumer
-                                                               │
-                                                               ▼
-                                                    SettlementPublisher
-                                                               │
-                                                               ▼
-                                      UPDATE bets SET status=? WHERE status=PENDING
+Kafka: event-outcomes
+  │
+  ▼ exactly_once_v2
+Kafka Streams Deduplicator
+  │ processed-event-outcomes state store
+  ├── eventId уже существует ─────────────► DROP
+  ├── malformed ──────────────────────────► event-outcomes.DLT
+  └── новый eventId, key=eventId
+                  ▼
+Kafka: settlement-page-tasks
+  │ Kafka transaction
+  ▼
+PageTaskConsumer
+  │ DB keyset page
+  ├── key=betId ──────────────────────────► bet-settlement-commands
+  └── key=eventId ────────────────────────► next settlement-page-task
+                                                │
+                                                ▼
+                                         DeliveryConsumer
+                                                │
+                                                ▼
+                                         SettlementPublisher
+                                                │
+                                                ▼
+                         UPDATE bets SET status=? WHERE status=PENDING
 ```
 
-Назначение топиков:
+## 3. Топики
 
-| Topic | Key | Payload | Назначение |
-|---|---|---|---|
-| `event-outcomes` | `eventId` | `EventOutcome` | Обязательный входной event по условию задачи |
-| `settlement-page-tasks` | `eventId` | `SettlementPageTask` | Последовательное продолжение keyset-обхода одного event |
-| `bet-settlement-commands` | `betId` | `BetSettlementCommand` | Параллельная доставка отдельных settlement-команд |
-| `<source-topic>.DLT` | исходный key | исходный payload | Невосстановимая ошибка после исчерпания retry |
+| Topic | Partitions | Key | Назначение |
+|---|---:|---|---|
+| `event-outcomes` | 16 | `eventId` | Обязательный входной event |
+| `settlement-page-tasks` | 32 | `eventId` | Продолжение keyset-обхода event |
+| `bet-settlement-commands` | 32 | `betId` | Settlement отдельной ставки |
+| `event-outcomes.DLT` | 16 | исходный key | Невалидный outcome |
+| `settlement-page-tasks.DLT` | 32 | исходный key | Необработанная page task |
+| `bet-settlement-commands.DLT` | 32 | исходный key | Необработанная settlement-команда |
 
-Основные и DLT-топики создаёт Spring `KafkaAdmin` из `NewTopic` beans при запуске
-приложения. Фактическая конфигурация: 16 partitions для `event-outcomes` и его DLT,
-32 partitions для page tasks, settlement commands и соответствующих DLT; replication
-factor локального профиля равен 1. Совпадающее количество partitions позволяет отправлять
-ошибочный record в DLT с сохранением исходного номера partition.
+Топики создаёт Spring `KafkaAdmin` из `NewTopic` beans при старте приложения. Docker Compose
+поднимает только Kafka broker. Replication factor локального профиля равен 1.
 
-## 3. Детальный flow
+Kafka Streams дополнительно создаёт compacted changelog для persistent state store
+`processed-event-outcomes`. Changelog позволяет восстановить состояние после рестарта или
+переноса partition на другой экземпляр.
 
-### 3.1. Приём outcome
+## 4. Этапы обработки
 
-`POST /api/v1/event-outcomes` валидирует запрос и в одной DB-транзакции вставляет строку:
+### 4.1. HTTP → `event-outcomes`
+
+API валидирует обязательные поля, сериализует `EventOutcome` и выполняет:
 
 ```text
-event_outbox(
-  event_id PK,
-  shard_id,
-  payload,
-  next_retry_at,
-  created_at,
-  sent_at NULL
-)
+kafkaTemplate.send(event-outcomes, eventId, payload).get(timeout)
 ```
 
-`shard_id = floorMod(eventId.hashCode(), shardCount)`. PK по `event_id` делает повторный
-POST идемпотентным: первый запрос получает `202 ACCEPTED`, повторный — `200 DUPLICATE`.
+- broker подтвердил запись — `202 ACCEPTED`;
+- Kafka недоступна, timeout или publish завершился ошибкой — `503 Service Unavailable`;
+- клиент повторяет запрос после `503` или потерянного HTTP-response;
+- первый и повторный успешные POST возвращают `202`; синхронного `200 DUPLICATE` нет.
 
-### 3.2. Шардированный DB-outbox relay
+Outcome DB-outbox отсутствует. Это уменьшает код и исключает отдельные scheduler,
+шардирование и relay, но API не может принимать outcome во время недоступности Kafka.
 
-Каждый экземпляр получает `instanceIndex` и `instanceCount` и обслуживает только шарды:
+### 4.2. Дедупликация outcome
+
+Kafka Streams читает `event-outcomes`, проверяет Kafka key и payload и использует persistent
+key-value store:
 
 ```text
-shard % instanceCount == instanceIndex
+processed-event-outcomes[eventId] = timestamp
 ```
 
-Relay выбирает небольшой batch готовых строк только своих шардов, синхронно ждёт broker ack
-для публикации в `event-outcomes`, после чего выставляет `sent_at`. При ошибке переносит
-`next_retry_at`.
+Для нового `eventId` topology одновременно:
 
-Это сознательно простая статическая схема:
+1. записывает `eventId` в state store и его changelog;
+2. публикует начальную `SettlementPageTask(afterBetId=null)`;
+3. фиксирует offset входного outcome.
 
-- разные экземпляры читают непересекающиеся части outbox;
-- добавление экземпляров увеличивает параллелизм relay;
-- при падении экземпляра его шарды ждут ручного переназначения;
-- `shardCount` нельзя менять, пока существуют необработанные строки;
-- уникальность `instanceIndex` должна обеспечиваться deployment-конфигурацией.
-- все relay instances должны работать с одной общей БД.
+`processing.guarantee=exactly_once_v2` делает эти действия одной Kafka-транзакцией. При
+падении до commit ни marker, ни page task, ни offset не видны. После commit повторный record
+с тем же `eventId` находится в store и отбрасывается. Kafka Streams атомарно связывает
+input offset, state store changelog и output record; обычный `@KafkaListener` с локальным
+`Set` такой гарантии не даёт.
 
-Сбой после Kafka publish и до `sent_at` создаёт дубль, но не потерю.
+State store хранит `eventId` без TTL. Это обеспечивает постоянную дедупликацию ценой роста
+store на одну небольшую запись для каждого завершённого event.
 
-### 3.3. Outcome → первая page task
+Malformed outcome не ретраится, поскольку ошибка JSON/валидации детерминирована: исходные
+key и payload сразу публикуются в `event-outcomes.DLT` в транзакции Streams.
 
-`OutcomeKafkaListener` читает `event-outcomes`. В Kafka-транзакции он публикует начальную
-задачу с `afterBetId = null` в `settlement-page-tasks`. Commit атомарно фиксирует produced
-record и consumer offset. При сбое фиксируется ни то, ни другое.
+### 4.3. Постраничный обход ставок
 
-### 3.4. Страничный обход ставок
-
-`SettlementPageKafkaListener` получает одну page task и запрашивает не более `pageSize`
-ставок:
+`SettlementPageKafkaListener` читает page task и запрашивает не более `pageSize` ставок:
 
 ```sql
 WHERE event_id = :eventId
@@ -132,29 +128,27 @@ ORDER BY bet_id
 LIMIT :pageSize
 ```
 
-Для первой страницы условие по `afterBetId` отсутствует. Индекс `(event_id, bet_id)` делает
-стоимость запроса зависимой от размера страницы, а не от номера страницы.
+Для первой страницы условие по `afterBetId` отсутствует. Используется индекс
+`(event_id, bet_id)`, поэтому нет дорогого offset pagination.
 
-В одной Kafka-транзакции consumer:
+В одной Kafka-транзакции page consumer:
 
-1. публикует `BetSettlementCommand` для каждой найденной ставки;
-2. если получена полная страница, публикует следующую task с последним `betId` как cursor;
+1. публикует `BetSettlementCommand` для найденных ставок;
+2. для полной страницы публикует следующую task с последним `betId`;
 3. фиксирует входной offset вместе со всеми выходными records.
 
-Пустая или неполная страница завершает event без отдельной job-таблицы. Для страницы ровно
-в `pageSize` записей появится ещё одна, пустая, task — это упрощает протокол и не влияет на
-корректность.
+Неполная или пустая страница завершает цепочку. Если количество ставок равно
+`N × pageSize`, последняя полная страница создаёт ещё одну пустую проверочную task.
 
-Все task одного event имеют `key=eventId`, поэтому попадают в одну Kafka partition. Более
-того, следующая task создаётся только при завершении предыдущей: один event обходится
-последовательно и с ограниченной памятью, а разные events обрабатываются параллельно
-partition-ами и consumer-ами группы.
+Следующая task появляется только после предыдущей и имеет `key=eventId`. Один большой event
+читается последовательно и держит в памяти только страницу; разные events параллельно
+обрабатываются partition-ами consumer group.
 
-### 3.5. Доставка settlement
+### 4.4. Доставка settlement
 
-`SettlementCommandKafkaListener` читает команды параллельно. `SettlementPublisher` скрывает
-конкретный transport. В базовом профиле `InMemorySettlementPublisher` вызывает
-`BetSettlementService`, который выполняет атомарный conditional update:
+Команды имеют `key=betId`, поэтому ставки одного большого event распределяются между
+partition-ами и delivery workers. Базовый `InMemorySettlementPublisher` вызывает
+`BetSettlementService`, выполняющий:
 
 ```sql
 UPDATE bets
@@ -162,109 +156,97 @@ SET status = :result, settled_at = :now
 WHERE bet_id = :betId AND status = 'PENDING'
 ```
 
-Если DB commit прошёл, а Kafka offset не зафиксирован, команда будет доставлена повторно;
-второй update изменит 0 строк. Поэтому граница Kafka → DB имеет at-least-once delivery с
-идемпотентным эффектом, а не распределённую exactly-once транзакцию.
+Kafka offset и DB commit не являются общей транзакцией. Если DB commit прошёл, а consumer
+упал до Kafka commit, команда придёт повторно; conditional update изменит 0 строк. Поэтому
+граница Kafka → DB имеет at-least-once delivery с идемпотентным эффектом.
 
-## 4. Транзакционные границы и гарантии
+## 5. Транзакционные границы
 
-| Граница | Механизм | Результат |
+| Граница | Механизм | Гарантия |
 |---|---|---|
-| HTTP → H2 | DB transaction + outbox | После `202` outcome сохранён, пока живёт H2 |
-| H2 outbox → `event-outcomes` | broker ack, затем `sent_at` | At-least-once; возможен дубль |
-| `event-outcomes` → page task | Kafka transaction | Offset и task фиксируются атомарно |
-| page task → commands + next task | Kafka transaction | Вся страница и cursor-message фиксируются атомарно |
-| settlement command → H2 | conditional update | At-least-once с идемпотентным эффектом |
+| HTTP → `event-outcomes` | ждать broker ack | После `202` record принят Kafka |
+| outcome → dedup store + первая task | Kafka Streams `exactly_once_v2` | Один output на `eventId` |
+| page task → commands + next task | Kafka transaction | Offset и все output records атомарны |
+| settlement command → H2 | conditional update | At-least-once, идемпотентный эффект |
+| poison page/command → DLT | transactional recovery | DLT record и recovered offset атомарны |
 
-Kafka consumers используют `isolation.level=read_committed`. JPA и Kafka transaction
-managers разделены явно: JPA используется для DB-операций, Kafka manager — для consume/
-produce стадий. XA/2PC отсутствует.
+Consumers используют `isolation.level=read_committed`. JPA и Kafka transaction managers
+разделены; XA/2PC отсутствует. Для нескольких экземпляров обычный Kafka
+`transaction-id-prefix` уникален через `INSTANCE_ID`. Kafka Streams использует общий
+`application-id`, чтобы экземпляры входили в одну Streams application.
 
-### 4.1. Retry и DLT
+## 6. Retry и DLT
 
-Все три listener используют общий `DefaultAfterRollbackProcessor`. Если listener выбрасывает
-исключение, его Kafka-транзакция откатывается. После первоначальной обработки выполняются
-три повтора с интервалом 1 секунда. После исчерпания повторов
-`DeadLetterPublishingRecoverer` отправляет исходные key и payload в `<source-topic>.DLT`,
-сохраняя partition.
+Page-task и settlement-command listeners используют общий `DefaultAfterRollbackProcessor`:
 
-Публикация в DLT и фиксация offset проблемного сообщения выполняются в новой
-Kafka-транзакции. Поэтому consumer не блокирует partition навсегда и не теряет poison
-message: оно становится доступно для отдельного анализа или ручного replay из DLT.
+- исходная Kafka-транзакция откатывается;
+- выполняются три повтора с интервалом 1 секунда;
+- затем `DeadLetterPublishingRecoverer` публикует record в `<source-topic>.DLT`;
+- DLT publish и фиксация recovered offset выполняются в новой Kafka-транзакции.
 
-## 5. Edge cases
+Malformed outcome обрабатывает сама Streams topology и сразу направляет в
+`event-outcomes.DLT`; повторять детерминированную ошибку парсинга смысла нет.
+
+## 7. Основные edge cases
 
 ```text
-API DB insert не закоммичен
-  → 202 не возвращается; клиент может повторить запрос.
+Kafka недоступна при POST
+  → API возвращает 503; клиент повторяет запрос.
 
-DB commit прошёл, HTTP response потерян
-  → повторный POST получает DUPLICATE; новая цепочка не создаётся.
+Kafka приняла outcome, HTTP-response потерян
+  → клиент повторяет POST; в event-outcomes появляются два record;
+    Streams state store создаёт только одну page task.
 
-Kafka недоступна для EventOutboxRelay
-  → sent_at остаётся NULL; строка повторяется после retry delay.
+Streams instance падает до Kafka commit
+  → marker, output и offset откатываются; outcome читается повторно.
 
-Outcome опубликован, но markSent не выполнен
-  → outcome публикуется повторно; downstream Kafka flow может повториться,
-    settlement остаётся безопасным благодаря conditional update.
+Streams instance падает после commit
+  → marker восстанавливается из changelog; повторный outcome отбрасывается.
 
-Outcome/page consumer падает до Kafka commit
-  → входной offset и все выходные records откатываются вместе; сообщение читается снова.
+Outcome имеет невалидный JSON или key != payload.eventId
+  → record публикуется в event-outcomes.DLT.
 
 DB read страницы временно падает
-  → Kafka transaction откатывается; та же page task будет прочитана повторно.
+  → Kafka transaction откатывается; page task повторяется.
 
 Event содержит миллионы ставок
-  → в памяти находится только одна страница; следующий cursor хранится в Kafka message.
+  → в памяти только одна страница; cursor хранится в следующей Kafka task.
 
-Event содержит ровно N × pageSize ставок
-  → последняя полная страница создаёт пустую проверочную task, которая завершает цепочку.
+Page/command стабильно не обрабатывается
+  → после трёх повторов record транзакционно переносится в соответствующий DLT.
 
-Delivery падает до DB commit
-  → Kafka offset не фиксируется; команда повторяется.
-
-DB commit прошёл, consumer упал до Kafka offset commit
+DB commit settlement прошёл, Kafka commit не прошёл
   → команда повторяется; UPDATE WHERE status=PENDING становится no-op.
-
-Один relay instance недоступен
-  → его outbox-шарды не теряются, но стоят до восстановления или переназначения.
-
-Kafka message стабильно не обрабатывается
-  → исходная Kafka-транзакция откатывается; после трёх повторов record и ошибка
-    публикуются в DLT, а его offset фиксируется в той же recovery-транзакции.
 ```
 
-## 6. Масштабирование
+## 8. Масштабирование
 
-- Outcome API масштабируется горизонтально; PK `event_outbox.event_id` разрешает гонку
-  одинаковых POST.
-- EventOutboxRelay масштабируется статическим распределением `shard_id`.
-- InitialTaskConsumer масштабируется partition-ами `event-outcomes`.
-- PageTaskConsumer масштабируется partition-ами `settlement-page-tasks`; параллелизм — между
-  events, но не внутри одного event.
-- DeliveryConsumer масштабируется partition-ами `bet-settlement-commands`; один большой
-  event может рассчитываться множеством delivery workers после expansion страниц.
-- Максимальная память expansion — `O(pageSize)`, а не `O(numberOfBets)`.
+- Outcome API масштабируется как stateless HTTP/Kafka producer.
+- Deduplicator масштабируется partition-ами `event-outcomes`; state store partitioned и
+  восстанавливается из changelog.
+- Page workers масштабируются между events partition-ами `settlement-page-tasks`.
+- Один event последовательно производит страницы, поэтому cursor не требует lock/lease.
+- Delivery workers масштабируются partition-ами `bet-settlement-commands`, включая команды
+  одного большого event.
+- Память expansion ограничена `O(pageSize)`.
 
-Сознательное ограничение: чтение ставок одного event выполняет один page worker за раз.
-Это сохраняет простой cursor и порядок без claim/lease таблиц. Параллелизм команд внутри
-этого event появляется на следующей стадии.
+Локальный H2 остаётся одно-процессным профилем. Для реального горизонтального
+масштабирования delivery workers нужна общая SQL-база ставок.
 
-## 7. Структура пакетов
+## 9. Структура пакетов
 
 ```text
 com.sportygroup.settlement
 ├── outcome
-│   ├── api          HTTP request/response/controller
-│   ├── config       shard properties
-│   ├── model        EventOutcome, EventOutboxEntity
-│   ├── repository   EventOutboxRepository
-│   ├── service      acceptance, outbox and shard services
-│   └── messaging    sharded relay and Kafka publisher
+│   ├── api          HTTP request/response/controller/error handler
+│   ├── model        EventOutcome
+│   ├── service      API acceptance and publish error
+│   └── messaging    direct Kafka publisher
 ├── expansion
 │   ├── model        SettlementPageTask, SettlementDecider
-│   ├── service      initial task and page orchestration
-│   └── messaging    Kafka listeners and publishers
+│   ├── service      page orchestration
+│   ├── messaging    page listener and Kafka publishers
+│   └── stream       outcome deduplication topology and stateful processor
 ├── delivery
 │   ├── model        BetSettlementCommand
 │   ├── service      delivery orchestration
@@ -274,15 +256,22 @@ com.sportygroup.settlement
 │   ├── model        BetEntity, BetStatus, BetProjection
 │   ├── repository   BetRepository
 │   └── service      query and idempotent settlement services
-└── config           Kafka topics, transactions, scheduling, time
+└── config           Kafka topics, listener transactions, time
 ```
 
-Repository вызывается только из service своего feature-пакета. Messaging/API слои работают
-с service, а не с repository напрямую.
+Repositories вызываются только из service своего feature-пакета. API и messaging слои не
+обращаются к repositories напрямую.
 
-## 8. Конфигурация
+## 10. Конфигурация
 
 ```yaml
+spring:
+  kafka:
+    streams:
+      application-id: settlement-outcome-deduplicator
+      properties:
+        processing.guarantee: exactly_once_v2
+
 app:
   kafka:
     outcomes-topic: event-outcomes
@@ -291,16 +280,10 @@ app:
     outcomes-dlt-topic: event-outcomes.DLT
     page-tasks-dlt-topic: settlement-page-tasks.DLT
     settlement-commands-dlt-topic: bet-settlement-commands.DLT
-    dlt-suffix: .DLT
+    publish-timeout: 10s
     consumer-retry:
       interval: 1s
       max-retries: 3
-  event-relay:
-    shard-count: 16
-    instance-count: ${EVENT_RELAY_INSTANCE_COUNT:1}
-    instance-index: ${EVENT_RELAY_INSTANCE_INDEX:0}
-    batch-size: 100
-    poll-interval-ms: 500
   expansion:
     page-size: 1000
     concurrency: 4
@@ -309,19 +292,13 @@ app:
     transport: in-memory
 ```
 
-Число partition должно быть не меньше нужного consumer-параллелизма. Для нескольких
-реплик `transaction-id-prefix` Kafka producer обязан быть уникальным (`INSTANCE_ID`).
+## 11. Проверки
 
-## 9. Проверки
-
+- topology test: два outcome с одним `eventId` создают одну initial page task;
+- topology test: malformed outcome попадает в DLT;
 - unit: winner/loser decision;
-- unit: deterministic shard selection и owned shards;
 - unit: пустая, неполная и полная page, включая continuation;
-- unit: malformed Kafka payload не передаётся в service;
 - JPA integration: повторный settlement не меняет рассчитанную ставку;
-- full-flow integration с Embedded Kafka: HTTP → sharded outbox → три Kafka стадии →
-  итоговые статусы ставок, включая переход через несколько страниц и duplicate POST.
-- Kafka integration: malformed outcome после retry попадает в DLT с исходными key/payload.
-
-Пустой event проверяется unit-тестом page service: наблюдаемого DB job-state в упрощённой
-архитектуре намеренно нет.
+- full-flow integration с Embedded Kafka: HTTP → Streams dedup → page tasks → settlement
+  commands → статусы ставок, включая несколько страниц и повторный POST;
+- Kafka integration: malformed outcome реально появляется в `event-outcomes.DLT`.

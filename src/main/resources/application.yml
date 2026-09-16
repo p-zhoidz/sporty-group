@@ -33,6 +33,12 @@ spring:
         isolation.level: read_committed
     listener:
       ack-mode: record
+    streams:
+      # Stable identity of the topology and its state store; changing it requires a migration.
+      application-id: settlement-outcome-deduplicator
+      properties:
+        processing.guarantee: exactly_once_v2
+        replication.factor: 1
 
 app:
   kafka:
@@ -46,21 +52,14 @@ app:
     consumer-retry:
       interval: 1s
       max-retries: 3
+    publish-timeout: 10s
     listener-enabled: true
-  event-relay:
-    shard-count: 16
-    instance-count: ${EVENT_RELAY_INSTANCE_COUNT:1}
-    instance-index: ${EVENT_RELAY_INSTANCE_INDEX:0}
-    batch-size: 100
-    poll-interval-ms: 500
   expansion:
     page-size: 1000
     concurrency: 4
   delivery:
     concurrency: 4
     transport: in-memory
-  retry:
-    delay: 5s
 logging:
   level:
     com.sportygroup.settlement: INFO

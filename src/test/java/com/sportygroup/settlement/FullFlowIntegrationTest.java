@@ -5,8 +5,6 @@ import com.sportygroup.settlement.bet.model.BetEntity;
 import com.sportygroup.settlement.bet.model.BetStatus;
 import com.sportygroup.settlement.bet.repository.BetRepository;
 import com.sportygroup.settlement.outcome.api.EventOutcomeRequest;
-import com.sportygroup.settlement.outcome.model.EventOutboxEntity;
-import com.sportygroup.settlement.outcome.repository.EventOutboxRepository;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
@@ -41,15 +39,11 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 @SpringBootTest(properties = {
         "app.kafka.listener-enabled=true",
-        "app.event-relay.poll-interval-ms=25",
-        "app.event-relay.shard-count=16",
-        "app.event-relay.instance-count=1",
-        "app.event-relay.instance-index=0",
         "app.expansion.page-size=2",
         "app.expansion.concurrency=2",
         "app.delivery.concurrency=2",
         "spring.kafka.producer.transaction-id-prefix=test-${random.uuid}-",
-        "app.retry.delay=100ms"
+        "spring.kafka.streams.application-id=test-${random.uuid}"
 })
 @AutoConfigureMockMvc
 @EmbeddedKafka(
@@ -77,9 +71,6 @@ class FullFlowIntegrationTest {
     BetRepository betRepository;
 
     @Autowired
-    EventOutboxRepository eventOutboxRepository;
-
-    @Autowired
     KafkaTemplate<String, String> kafkaTemplate;
 
     @Autowired
@@ -102,7 +93,7 @@ class FullFlowIntegrationTest {
     }
 
     @Test
-    void duplicatePostDoesNotCreateAnotherOutboxRecord() throws Exception {
+    void duplicatePostIsAcceptedAndDoesNotChangeTheResult() throws Exception {
         String eventId = uniqueId("duplicate-event");
         String betId = uniqueId("duplicate-bet");
         EventOutcomeRequest outcome = new EventOutcomeRequest(eventId, "A vs B", "team-a");
@@ -115,13 +106,15 @@ class FullFlowIntegrationTest {
                         .extracting(BetEntity::getStatus)
                         .isEqualTo(BetStatus.WON));
 
-        postOutcome(outcome, 200, "DUPLICATE");
-
-        assertThat(eventOutboxRepository.findById(eventId)).isPresent();
+        postOutcome(outcome, 202, "ACCEPTED");
+        assertThat(betRepository.findById(betId))
+                .get()
+                .extracting(BetEntity::getStatus)
+                .isEqualTo(BetStatus.WON);
     }
 
     @Test
-    void malformedOutcomeIsMovedToDltAfterRetries() throws Exception {
+    void malformedOutcomeIsMovedToDlt() throws Exception {
         String key = uniqueId("malformed-outcome");
         String payload = "not-json";
         String dltTopic = "event-outcomes.DLT";
@@ -152,10 +145,6 @@ class FullFlowIntegrationTest {
     }
 
     private void assertScenarioCompleted(Scenario scenario) {
-        assertThat(eventOutboxRepository.findById(scenario.eventId()))
-                .get()
-                .extracting(EventOutboxEntity::getSentAt)
-                .isNotNull();
         assertThat(loadStatuses(scenario.expectedStatuses().keySet()))
                 .containsExactlyInAnyOrderEntriesOf(scenario.expectedStatuses());
     }
