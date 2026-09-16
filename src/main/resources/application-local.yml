@@ -5,3 +5,7 @@ spring:
     init:
       mode: always
       data-locations: classpath:db/local-data.sql
+
+logging:
+  level:
+    com.sportygroup.settlement: DEBUG

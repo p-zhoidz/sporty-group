@@ -45,26 +45,33 @@ public class RocketMqSettlementMessageListener implements MessageListenerConcurr
                 validate(command);
             } catch (IOException | IllegalArgumentException exception) {
                 log.warn(
-                        "Skipping invalid RocketMQ settlement messageId={} reason={}",
+                        "[ROCKETMQ_SETTLEMENT_INVALID][MESSAGE_ID: {}][REASON: {}]",
                         message.getMsgId(), exception.getMessage());
                 continue;
             }
 
             try {
+                log.debug(
+                        "[ROCKETMQ_SETTLEMENT_RECEIVED][EVENT_ID: {}][BET_ID: {}]"
+                                + "[MESSAGE_ID: {}][RECONSUME_TIMES: {}]",
+                        command.eventId(), command.betId(), message.getMsgId(),
+                        message.getReconsumeTimes());
                 var result = settlementService.settle(command.betId(), command.result());
                 if (result == BetSettlementService.Result.MISSING
                         || result == BetSettlementService.Result.CONFLICT) {
                     log.warn(
-                            "Skipping RocketMQ settlement betId={} result={} messageId={}",
+                            "[ROCKETMQ_SETTLEMENT_SKIPPED][BET_ID: {}][RESULT: {}][MESSAGE_ID: {}]",
                             command.betId(), result, message.getMsgId());
                     continue;
                 }
-                log.info(
-                        "Handled RocketMQ settlement betId={} result={} messageId={}",
-                        command.betId(), result, message.getMsgId());
+                log.debug(
+                        "[ROCKETMQ_SETTLEMENT_HANDLED][EVENT_ID: {}][BET_ID: {}]"
+                                + "[RESULT: {}][MESSAGE_ID: {}]",
+                        command.eventId(), command.betId(), result, message.getMsgId());
             } catch (Exception exception) {
                 log.error(
-                        "Temporary RocketMQ settlement failure betId={} messageId={} reconsumeTimes={}",
+                        "[ROCKETMQ_SETTLEMENT_TEMPORARY_FAILURE]"
+                                + "[BET_ID: {}][MESSAGE_ID: {}][RECONSUME_TIMES: {}]",
                         command.betId(), message.getMsgId(), message.getReconsumeTimes(), exception);
                 return ConsumeConcurrentlyStatus.RECONSUME_LATER;
             }

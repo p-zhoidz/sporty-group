@@ -4,12 +4,16 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sportygroup.settlement.expansion.model.SettlementPageTask;
 import com.sportygroup.settlement.expansion.service.SettlementPageService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 
 @Component
 public class SettlementPageKafkaListener {
+
+    private static final Logger log = LoggerFactory.getLogger(SettlementPageKafkaListener.class);
 
     private final ObjectMapper objectMapper;
     private final SettlementPageService service;
@@ -26,9 +30,19 @@ public class SettlementPageKafkaListener {
             containerFactory = "transactionalKafkaListenerContainerFactory",
             autoStartup = "${app.kafka.listener-enabled:true}")
     public void onMessage(String payload) {
-        SettlementPageTask task = deserialize(payload);
-        validate(task);
-        service.process(task);
+        try {
+            SettlementPageTask task = deserialize(payload);
+            validate(task);
+            log.info(
+                    "[SETTLEMENT_PAGE_RECEIVED][EVENT_ID: {}][AFTER_BET_ID: {}]",
+                    task.eventId(), task.afterBetId());
+            service.process(task);
+        } catch (MalformedKafkaMessageException exception) {
+            log.warn(
+                    "[SETTLEMENT_PAGE_INVALID][REASON: {}]",
+                    exception.getMessage());
+            throw exception;
+        }
     }
 
     private SettlementPageTask deserialize(String payload) {

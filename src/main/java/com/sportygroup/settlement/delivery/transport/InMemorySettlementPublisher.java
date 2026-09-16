@@ -21,8 +21,10 @@ public class InMemorySettlementPublisher implements SettlementPublisher {
 
     @Override
     public void publish(BetSettlementCommand command) {
-        log.info("Publishing settlement payload={}", command);
+        log.info("[IN_MEMORY_SETTLEMENT_PUBLISHING][PAYLOAD: {}]", command);
         var result = settlementService.settle(command.betId(), command.result());
-        log.info("Handled settlement betId={} result={}", command.betId(), result);
+        log.info(
+                "[IN_MEMORY_SETTLEMENT_HANDLED][BET_ID: {}][RESULT: {}]",
+                command.betId(), result);
     }
 }

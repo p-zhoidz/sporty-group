@@ -1,42 +1,39 @@
-# Settlement Trigger Service — архитектура реализации
+# Settlement Trigger Service — Implementation Architecture
 
-Статус: реализовано. Дата: 2026-09-16.
+Status: implemented. Date: 2026-09-16.
 
-## 1. Цель и ограничения
+## 1. Goal and Constraints
 
-Сервис принимает финальный исход события, публикует обязательное сообщение
-`event-outcomes`, дедуплицирует события по `eventId`, находит ставки страницами и создаёт
-отдельную settlement-команду для каждой ставки.
+The service accepts the final event outcome, publishes the mandatory `event-outcomes` message, deduplicates events by `eventId`, scans bets page by page, and creates a separate settlement command for each bet.
 
-Принятые ограничения домашнего задания:
+Accepted homework constraints:
 
-- один `eventId` имеет один финальный outcome; correction/resettlement нет;
-- после outcome новые ставки на событие не создаются;
-- потеря данных H2 при полном перезапуске допустима;
-- таблица `bets` не расширяется служебными полями orchestration;
-- в profile `rocketmq` settlement доставляется через RocketMQ; `betId` используется как
-  business idempotency key;
-- Kafka и RocketMQ не объединяются в XA/2PC-транзакцию.
+- one `eventId` has one final outcome; no correction/resettlement;
+- after the outcome, no new bets are created for the event;
+- loss of H2 data on full restart is acceptable;
+- the `bets` table is not extended with orchestration housekeeping fields;
+- in the `rocketmq` profile settlement is delivered via RocketMQ; `betId` is used as the business idempotency key;
+- Kafka and RocketMQ are not combined into an XA/2PC transaction.
 
-Стек: Java 21, Spring Boot 3.5, Spring Kafka, Kafka Streams, RocketMQ 5.3, Spring Data JPA, H2.
+Stack: Java 21, Spring Boot 3.5, Spring Kafka, Kafka Streams, RocketMQ 5.3, Spring Data JPA, H2.
 
-## 2. Сквозной flow
+## 2. End-to-End Flow
 
 ```text
 Client
   │ POST /api/v1/event-outcomes
   ▼
 Outcome API
-  │ publish key=eventId; ждать broker ack
+  │ publish key=eventId; wait for broker ack
   ▼
 Kafka: event-outcomes
   │
   ▼ exactly_once_v2
 Kafka Streams Deduplicator
   │ processed-event-outcomes state store
-  ├── eventId уже существует ─────────────► DROP
+  ├── eventId already exists ─────────────► DROP
   ├── malformed ──────────────────────────► event-outcomes.DLT
-  └── новый eventId, key=eventId
+  └── new eventId, key=eventId
                   ▼
 Kafka: settlement-page-tasks
   │ Kafka transaction
@@ -59,77 +56,63 @@ PageTaskConsumer
                          UPDATE bets SET status=? WHERE status=PENDING
 ```
 
-## 3. Топики
+## 3. Topics
 
-| Topic | Partitions | Key | Назначение |
+| Topic | Partitions | Key | Purpose |
 |---|---:|---|---|
-| `event-outcomes` | 16 | `eventId` | Обязательный входной event |
-| `settlement-page-tasks` | 32 | `eventId` | Продолжение keyset-обхода event |
-| `bet-settlement-commands` | 32 | `betId` | Settlement отдельной ставки |
-| `event-outcomes.DLT` | 16 | исходный key | Невалидный outcome |
-| `settlement-page-tasks.DLT` | 32 | исходный key | Необработанная page task |
-| `bet-settlement-commands.DLT` | 32 | исходный key | Необработанная settlement-команда |
+| `event-outcomes` | 16 | `eventId` | Mandatory input event |
+| `settlement-page-tasks` | 32 | `eventId` | Continuation of event keyset scan |
+| `bet-settlement-commands` | 32 | `betId` | Settlement of an individual bet |
+| `event-outcomes.DLT` | 16 | original key | Invalid outcome |
+| `settlement-page-tasks.DLT` | 32 | original key | Unprocessed page task |
+| `bet-settlement-commands.DLT` | 32 | original key | Unprocessed settlement command |
 
-RocketMQ использует топик `bet-settlements` с message key `betId`. После трёх неуспешных
-попыток consumer RocketMQ помещает сообщение в системный DLQ-топик
-`%DLQ%settlement-rocketmq-consumers`.
+RocketMQ uses the `bet-settlements` topic with message key `betId`. After three unsuccessful attempts the RocketMQ consumer places the message into the system DLQ topic `%DLQ%settlement-rocketmq-consumers`.
 
-Kafka-топики создаёт Spring `KafkaAdmin` из `NewTopic` beans при старте приложения. Docker
-Compose поднимает Kafka broker, RocketMQ NameServer и RocketMQ Broker. RocketMQ topic
-создаётся broker-ом при первой публикации. Replication factor локальной Kafka равен 1.
+Spring `KafkaAdmin` creates the Kafka topics from `NewTopic` beans at application startup. Docker Compose brings up the Kafka broker, the RocketMQ NameServer, and the RocketMQ Broker. The RocketMQ topic is created by the broker on first publish. The local Kafka replication factor is 1.
 
-Kafka Streams дополнительно создаёт compacted changelog для persistent state store
-`processed-event-outcomes`. Changelog позволяет восстановить состояние после рестарта или
-переноса partition на другой экземпляр.
+Kafka Streams additionally creates a compacted changelog for the persistent state store `processed-event-outcomes`. The changelog allows state recovery after a restart or partition migration to another instance.
 
-## 4. Этапы обработки
+## 4. Processing Stages
 
 ### 4.1. HTTP → `event-outcomes`
 
-API валидирует обязательные поля, сериализует `EventOutcome` и выполняет:
+The API validates the mandatory fields, serializes `EventOutcome`, and executes:
 
 ```text
 kafkaTemplate.send(event-outcomes, eventId, payload).get(timeout)
 ```
 
-- broker подтвердил запись — `202 ACCEPTED`;
-- Kafka недоступна, timeout или publish завершился ошибкой — `503 Service Unavailable`;
-- клиент повторяет запрос после `503` или потерянного HTTP-response;
-- первый и повторный успешные POST возвращают `202`; синхронного `200 DUPLICATE` нет.
+- broker acknowledged the write — `202 ACCEPTED`;
+- Kafka unavailable, timeout, or publish failed — `503 Service Unavailable`;
+- the client retries the request after a `503` or a lost HTTP response;
+- the first and repeated successful POSTs return `202`; there is no synchronous `200 DUPLICATE`.
 
-Outcome DB-outbox отсутствует. Это уменьшает код и исключает отдельные scheduler,
-шардирование и relay, но API не может принимать outcome во время недоступности Kafka.
+There is no outcome DB-outbox. This reduces code and eliminates a separate scheduler, sharding, and relay, but the API cannot accept outcomes while Kafka is unavailable.
 
-### 4.2. Дедупликация outcome
+### 4.2. Outcome Deduplication
 
-Kafka Streams читает `event-outcomes`, проверяет Kafka key и payload и использует persistent
-key-value store:
+Kafka Streams reads `event-outcomes`, checks the Kafka key and payload, and uses a persistent key-value store:
 
 ```text
 processed-event-outcomes[eventId] = timestamp
 ```
 
-Для нового `eventId` topology одновременно:
+For a new `eventId` the topology atomically:
 
-1. записывает `eventId` в state store и его changelog;
-2. публикует начальную `SettlementPageTask(afterBetId=null)`;
-3. фиксирует offset входного outcome.
+1. writes `eventId` into the state store and its changelog;
+2. publishes the initial `SettlementPageTask(afterBetId=null)`;
+3. commits the input outcome offset.
 
-`processing.guarantee=exactly_once_v2` делает эти действия одной Kafka-транзакцией. При
-падении до commit ни marker, ни page task, ни offset не видны. После commit повторный record
-с тем же `eventId` находится в store и отбрасывается. Kafka Streams атомарно связывает
-input offset, state store changelog и output record; обычный `@KafkaListener` с локальным
-`Set` такой гарантии не даёт.
+`processing.guarantee=exactly_once_v2` makes these actions a single Kafka transaction. On crash before commit, neither the marker, nor the page task, nor the offset is visible. After commit, a repeated record with the same `eventId` is found in the store and dropped. Kafka Streams atomically binds the input offset, the state store changelog, and the output record; a plain `@KafkaListener` with a local `Set` does not provide this guarantee.
 
-State store хранит `eventId` без TTL. Это обеспечивает постоянную дедупликацию ценой роста
-store на одну небольшую запись для каждого завершённого event.
+The state store keeps `eventId` without TTL. This provides permanent deduplication at the cost of growing the store by one small record per completed event.
 
-Malformed outcome не ретраится, поскольку ошибка JSON/валидации детерминирована: исходные
-key и payload сразу публикуются в `event-outcomes.DLT` в транзакции Streams.
+A malformed outcome is not retried, since a JSON/validation error is deterministic: the original key and payload are immediately published to `event-outcomes.DLT` in the Streams transaction.
 
-### 4.3. Постраничный обход ставок
+### 4.3. Bet Page Scan
 
-`SettlementPageKafkaListener` читает page task и запрашивает не более `pageSize` ставок:
+`SettlementPageKafkaListener` reads a page task and requests at most `pageSize` bets:
 
 ```sql
 WHERE event_id = :eventId
@@ -138,34 +121,25 @@ ORDER BY bet_id
 LIMIT :pageSize
 ```
 
-Для первой страницы условие по `afterBetId` отсутствует. Используется индекс
-`(event_id, bet_id)`, поэтому нет дорогого offset pagination.
+For the first page the `afterBetId` condition is absent. The `(event_id, bet_id)` index is used, so there is no expensive offset pagination.
 
-В одной Kafka-транзакции page consumer:
+In a single Kafka transaction the page consumer:
 
-1. публикует `BetSettlementCommand` для найденных ставок;
-2. для полной страницы публикует следующую task с последним `betId`;
-3. фиксирует входной offset вместе со всеми выходными records.
+1. publishes a `BetSettlementCommand` for each found bet;
+2. for a full page publishes the next task with the last `betId`;
+3. commits the input offset together with all output records.
 
-Неполная или пустая страница завершает цепочку. Если количество ставок равно
-`N × pageSize`, последняя полная страница создаёт ещё одну пустую проверочную task.
+An incomplete or empty page ends the chain. If the bet count equals `N × pageSize`, the last full page creates one more empty verification task.
 
-Следующая task появляется только после предыдущей и имеет `key=eventId`. Один большой event
-читается последовательно и держит в памяти только страницу; разные events параллельно
-обрабатываются partition-ами consumer group.
+The next task appears only after the previous one and has `key=eventId`. One large event is read sequentially and keeps only one page in memory; different events are processed in parallel by consumer-group partitions.
 
-### 4.4. Доставка settlement
+### 4.4. Settlement Delivery
 
-Команды имеют Kafka `key=betId`, поэтому ставки одного большого event распределяются между
-partition-ами bridge workers. `RocketMqSettlementPublisher` сериализует команду, назначает
-RocketMQ message key равным `betId` и выполняет синхронный send с ожиданием `SEND_OK`.
+Commands have Kafka `key=betId`, so bets of one large event are spread across partitions of the bridge workers. `RocketMqSettlementPublisher` serializes the command, sets the RocketMQ message key to `betId`, and performs a synchronous send waiting for `SEND_OK`.
 
-Если RocketMQ не подтвердил send, Kafka listener бросает исключение и его входная Kafka-
-транзакция откатывается. Если RocketMQ подтвердил send, но процесс упал до Kafka commit,
-команда будет опубликована повторно. Общей транзакции между брокерами нет, поэтому граница
-Kafka → RocketMQ имеет at-least-once semantics.
+If RocketMQ did not acknowledge the send, the Kafka listener throws an exception and its inbound Kafka transaction rolls back. If RocketMQ acknowledged the send but the process crashed before the Kafka commit, the command will be published again. There is no shared transaction between the brokers, so the Kafka → RocketMQ boundary has at-least-once semantics.
 
-RocketMQ consumer вызывает `BetSettlementService`, выполняющий:
+The RocketMQ consumer calls `BetSettlementService`, which executes:
 
 ```sql
 UPDATE bets
@@ -173,101 +147,82 @@ SET status = :result, settled_at = :now
 WHERE bet_id = :betId AND status = 'PENDING'
 ```
 
-Если DB commit прошёл, а RocketMQ не получил успешный consume result, команда придёт
-повторно; conditional update изменит 0 строк. Поэтому итоговая обработка также имеет
-at-least-once delivery с идемпотентным эффектом. Технический RocketMQ `msgId` для dedup не
-используется: стабильным бизнес-ключом остаётся `betId`. Повтор с тем же результатом
-подтверждается как duplicate. Malformed message, отсутствующий `betId` и конфликтующий
-результат считаются невосстановимыми: consumer пишет `WARN` и подтверждает сообщение без
-retry. Неожиданная DB/runtime ошибка возвращает `RECONSUME_LATER`.
+If the DB commit succeeded but RocketMQ did not receive a successful consume result, the command arrives again; the conditional update changes 0 rows. So the final processing also has at-least-once delivery with an idempotent effect. The technical RocketMQ `msgId` is not used for dedup: the stable business key remains `betId`. A repeat with the same result is acknowledged as a duplicate. Malformed message, missing `betId`, and conflicting result are considered unrecoverable: the consumer logs `WARN` and acknowledges the message without retry. An unexpected DB/runtime error returns `RECONSUME_LATER`.
 
-## 5. Транзакционные границы
+## 5. Transactional Boundaries
 
-| Граница | Механизм | Гарантия |
+| Boundary | Mechanism | Guarantee |
 |---|---|---|
-| HTTP → `event-outcomes` | ждать broker ack | После `202` record принят Kafka |
-| outcome → dedup store + первая task | Kafka Streams `exactly_once_v2` | Один output на `eventId` |
-| page task → commands + next task | Kafka transaction | Offset и все output records атомарны |
-| Kafka command → RocketMQ | sync send + Kafka retry | At-least-once, возможны дубликаты |
-| RocketMQ settlement → H2 | conditional update | At-least-once, идемпотентный эффект |
-| poison page/command → DLT | transactional recovery | DLT record и recovered offset атомарны |
+| HTTP → `event-outcomes` | wait for broker ack | After `202` the record is accepted by Kafka |
+| outcome → dedup store + first task | Kafka Streams `exactly_once_v2` | One output per `eventId` |
+| page task → commands + next task | Kafka transaction | Offset and all output records are atomic |
+| Kafka command → RocketMQ | sync send + Kafka retry | At-least-once, duplicates possible |
+| RocketMQ settlement → H2 | conditional update | At-least-once, idempotent effect |
+| poison page/command → DLT | transactional recovery | DLT record and recovered offset are atomic |
 
-Consumers используют `isolation.level=read_committed`. JPA и Kafka transaction managers
-разделены; XA/2PC отсутствует. Для нескольких экземпляров обычный Kafka
-`transaction-id-prefix` уникален через `INSTANCE_ID`. Kafka Streams использует общий
-`application-id`, чтобы экземпляры входили в одну Streams application.
+Consumers use `isolation.level=read_committed`. The JPA and Kafka transaction managers are separated; XA/2PC is absent. For multiple instances the regular Kafka `transaction-id-prefix` is unique via `INSTANCE_ID`. Kafka Streams uses a shared `application-id` so instances join one Streams application.
 
-## 6. Retry и DLT
+## 6. Retry and DLT
 
-Page-task и settlement-command listeners используют общий `DefaultAfterRollbackProcessor`:
+Page-task and settlement-command listeners share a `DefaultAfterRollbackProcessor`:
 
-- исходная Kafka-транзакция откатывается;
-- выполняются три повтора с интервалом 1 секунда;
-- затем `DeadLetterPublishingRecoverer` публикует record в `<source-topic>.DLT`;
-- DLT publish и фиксация recovered offset выполняются в новой Kafka-транзакции.
+- the original Kafka transaction rolls back;
+- three retries with a 1 second interval are performed;
+- then `DeadLetterPublishingRecoverer` publishes the record to `<source-topic>.DLT`;
+- the DLT publish and the recovered-offset commit run in a new Kafka transaction.
 
-Malformed outcome обрабатывает сама Streams topology и сразу направляет в
-`event-outcomes.DLT`; повторять детерминированную ошибку парсинга смысла нет.
+A malformed outcome is handled by the Streams topology itself and routed directly to `event-outcomes.DLT`; retrying a deterministic parsing error makes no sense.
 
-Ошибка публикации Kafka settlement-command в RocketMQ приводит к rollback Kafka offset и
-обычному Kafka retry. После трёх повторов исходная команда попадает в
-`bet-settlement-commands.DLT`. Временная DB/runtime ошибка RocketMQ consumer возвращает
-`RECONSUME_LATER`; после трёх повторов RocketMQ Broker переносит сообщение в
-`%DLQ%settlement-rocketmq-consumers`. Malformed, missing и conflict не ретраятся: они
-логируются на уровне `WARN` и подтверждаются.
+A Kafka settlement-command publish failure to RocketMQ causes a Kafka offset rollback and a regular Kafka retry. After three retries the original command lands in `bet-settlement-commands.DLT`. A transient DB/runtime error of the RocketMQ consumer returns `RECONSUME_LATER`; after three retries the RocketMQ broker moves the message to `%DLQ%settlement-rocketmq-consumers`. Malformed, missing, and conflict are not retried: they are logged at `WARN` and acknowledged.
 
-## 7. Основные edge cases
+## 7. Main Edge Cases
 
 ```text
-Kafka недоступна при POST
-  → API возвращает 503; клиент повторяет запрос.
+Kafka unavailable on POST
+  → API returns 503; client retries the request.
 
-Kafka приняла outcome, HTTP-response потерян
-  → клиент повторяет POST; в event-outcomes появляются два record;
-    Streams state store создаёт только одну page task.
+Kafka accepted the outcome, HTTP response lost
+  → client repeats POST; two records appear in event-outcomes;
+    Streams state store creates only one page task.
 
-Streams instance падает до Kafka commit
-  → marker, output и offset откатываются; outcome читается повторно.
+Streams instance crashes before Kafka commit
+  → marker, output, and offset roll back; outcome is read again.
 
-Streams instance падает после commit
-  → marker восстанавливается из changelog; повторный outcome отбрасывается.
+Streams instance crashes after commit
+  → marker is restored from changelog; repeated outcome is dropped.
 
-Outcome имеет невалидный JSON или key != payload.eventId
-  → record публикуется в event-outcomes.DLT.
+Outcome has invalid JSON or key != payload.eventId
+  → record is published to event-outcomes.DLT.
 
-DB read страницы временно падает
-  → Kafka transaction откатывается; page task повторяется.
+Page DB read temporarily fails
+  → Kafka transaction rolls back; page task repeats.
 
-Event содержит миллионы ставок
-  → в памяти только одна страница; cursor хранится в следующей Kafka task.
+Event contains millions of bets
+  → only one page in memory; cursor stored in next Kafka task.
 
-Page/command стабильно не обрабатывается
-  → после трёх повторов record транзакционно переносится в соответствующий DLT.
+Page/command persistently fails
+  → after three retries the record is transactionally moved to the matching DLT.
 
-RocketMQ ack получен, Kafka commit не прошёл
-  → команда повторно публикуется в RocketMQ с тем же business key=betId.
+RocketMQ ack received, Kafka commit failed
+  → command is republished to RocketMQ with the same business key=betId.
 
-DB commit settlement прошёл, RocketMQ consume result потерян
-  → сообщение повторяется; UPDATE WHERE status=PENDING становится no-op.
+DB settlement commit done, RocketMQ consume result lost
+  → message repeats; UPDATE WHERE status=PENDING becomes a no-op.
 ```
 
-## 8. Масштабирование
+## 8. Scaling
 
-- Outcome API масштабируется как stateless HTTP/Kafka producer.
-- Deduplicator масштабируется partition-ами `event-outcomes`; state store partitioned и
-  восстанавливается из changelog.
-- Page workers масштабируются между events partition-ами `settlement-page-tasks`.
-- Один event последовательно производит страницы, поэтому cursor не требует lock/lease.
-- Kafka → RocketMQ bridge workers масштабируются partition-ами
-  `bet-settlement-commands`, включая команды одного большого event.
-- RocketMQ consumers с общей group распределяют сообщения между экземплярами; повторная
-  доставка безопасна благодаря conditional update.
-- Память expansion ограничена `O(pageSize)`.
+- Outcome API scales as a stateless HTTP/Kafka producer.
+- Deduplicator scales by `event-outcomes` partitions; the state store is partitioned and restored from changelog.
+- Page workers scale across events by `settlement-page-tasks` partitions.
+- One event produces pages sequentially, so the cursor needs no lock/lease.
+- Kafka → RocketMQ bridge workers scale by `bet-settlement-commands` partitions, including commands of one large event.
+- RocketMQ consumers with a shared group distribute messages across instances; redelivery is safe thanks to the conditional update.
+- Expansion memory is bounded by `O(pageSize)`.
 
-Локальный H2 остаётся одно-процессным профилем. Для реального горизонтального
-масштабирования delivery workers нужна общая SQL-база ставок.
+Local H2 remains a single-process profile. Real horizontal scaling of delivery workers requires a shared SQL bets database.
 
-## 9. Структура пакетов
+## 9. Package Structure
 
 ```text
 com.sportygroup.settlement
@@ -294,10 +249,9 @@ com.sportygroup.settlement
 └── config           Kafka topics, listener transactions, time
 ```
 
-Repositories вызываются только из service своего feature-пакета. API и messaging слои не
-обращаются к repositories напрямую.
+Repositories are called only from the service of their own feature package. API and messaging layers do not access repositories directly.
 
-## 10. Конфигурация
+## 10. Configuration
 
 ```yaml
 spring:
@@ -336,28 +290,24 @@ app:
     consumer-enabled: true
 ```
 
-Settlement transport выбирается Spring profile, а не property:
+Settlement transport is selected by Spring profile, not by property:
 
-| Active profile | `SettlementPublisher` | Назначение |
+| Active profile | `SettlementPublisher` | Purpose |
 |---|---|---|
-| нет `rocketmq`/`in-memory` | `LoggingSettlementPublisher` | Безопасный default без внешней доставки |
-| `rocketmq` | `RocketMqSettlementPublisher` | Реальная доставка и consumer RocketMQ |
-| `in-memory` без `rocketmq` | `InMemorySettlementPublisher` | Изолированный full-flow тест |
+| no `rocketmq`/`in-memory` | `LoggingSettlementPublisher` | Safe default without external delivery |
+| `rocketmq` | `RocketMqSettlementPublisher` | Real delivery and RocketMQ consumer |
+| `in-memory` without `rocketmq` | `InMemorySettlementPublisher` | Isolated full-flow test |
 
-Profile `local` отвечает только за seed H2 и при необходимости комбинируется с `rocketmq`.
-Если одновременно активировать `rocketmq` и `in-memory`, выбирается RocketMQ adapter.
+The `local` profile is only responsible for H2 seeding and can be combined with `rocketmq` when needed. If `rocketmq` and `in-memory` are activated together, the RocketMQ adapter is selected.
 
-## 11. Проверки
+## 11. Verification
 
-- topology test: два outcome с одним `eventId` создают одну initial page task;
-- topology test: malformed outcome попадает в DLT;
+- topology test: two outcomes with one `eventId` create one initial page task;
+- topology test: malformed outcome lands in DLT;
 - unit: winner/loser decision;
-- unit: пустая, неполная и полная page, включая continuation;
-- JPA integration: повторный settlement не меняет рассчитанную ставку;
-- unit: RocketMQ publisher ждёт `SEND_OK` и передаёт `betId` как business key;
-- unit: RocketMQ consumer подтверждает applied/duplicate/malformed/missing и ретраит
-  временную ошибку обработки;
-- full-flow integration с Embedded Kafka: HTTP → Streams dedup → page tasks → settlement
-  commands → `in-memory` profile → статусы ставок, включая несколько страниц и повторный
-  POST;
-- Kafka integration: malformed outcome реально появляется в `event-outcomes.DLT`.
+- unit: empty, incomplete, and full page, including continuation;
+- JPA integration: repeated settlement does not change the settled bet;
+- unit: RocketMQ publisher waits for `SEND_OK` and passes `betId` as business key;
+- unit: RocketMQ consumer acknowledges applied/duplicate/malformed/missing and retries a temporary processing error;
+- full-flow integration with Embedded Kafka: HTTP → Streams dedup → page tasks → settlement commands → `in-memory` profile → bet statuses, including multiple pages and repeated POST;
+- Kafka integration: malformed outcome actually appears in `event-outcomes.DLT`.

@@ -14,6 +14,6 @@ public class LoggingSettlementPublisher implements SettlementPublisher {
 
     @Override
     public void publish(BetSettlementCommand command) {
-        log.info("Logging settlement payload={}", command);
+        log.info("[SETTLEMENT_LOGGED][PAYLOAD: {}]", command);
     }
 }
